@@ -11,10 +11,16 @@ Rust client and worker runtime for [Corvo](https://corvo.dev), the fast job queu
 
 ```toml
 [dependencies]
-corvo-client = "0.1"
+corvo-client = "0.2"
 # For worker:
-corvo-worker = "0.1"
+corvo-worker = "0.2"
 ```
+
+## Compatibility
+
+| SDK Version | Corvo Server |
+|-------------|-------------|
+| 0.2.x       | >= 0.2.0    |
 
 ## Quick Start
 

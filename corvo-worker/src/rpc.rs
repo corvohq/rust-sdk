@@ -44,8 +44,13 @@ pub struct RpcAuthOptions {
     pub api_key_header: Option<String>,
 }
 
+const SDK_NAME: &str = "corvo-rust";
+const SDK_VERSION: &str = "0.2.0";
+
 fn build_metadata(auth: &RpcAuthOptions) -> MetadataMap {
     let mut map = MetadataMap::new();
+    map.insert("x-corvo-client-name", SDK_NAME.parse().unwrap());
+    map.insert("x-corvo-client-version", SDK_VERSION.parse().unwrap());
     for (k, v) in &auth.headers {
         if let (Ok(name), Ok(val)) = (k.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>(), v.parse()) {
             map.insert(name, val);
