@@ -8,15 +8,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          protoc --version
       - run: cargo build --release
-      - run: cargo test
-      - run: cargo publish -p corvo-client --dry-run
-      - run: cargo publish -p corvo-worker --dry-run
-      # Uncomment when ready:
-      # - run: cargo publish -p corvo-client
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
-      # - run: cargo publish -p corvo-worker
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+      - run: cargo test --lib
+      - run: cargo publish -p corvo-client
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+      - run: cargo publish -p corvo-worker
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
