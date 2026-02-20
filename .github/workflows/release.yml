@@ -1,0 +1,22 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo test
+      - run: cargo publish -p corvo-client --dry-run
+      - run: cargo publish -p corvo-worker --dry-run
+      # Uncomment when ready:
+      # - run: cargo publish -p corvo-client
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+      # - run: cargo publish -p corvo-worker
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}

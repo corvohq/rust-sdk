@@ -1,0 +1,3 @@
+[workspace]
+members = ["corvo-client", "corvo-worker"]
+resolver = "2"
