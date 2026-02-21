@@ -253,6 +253,21 @@ pub struct BulkTask {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Default)]
+pub struct SubscribeOptions {
+    pub queues: Vec<String>,
+    pub job_ids: Vec<String>,
+    pub types: Vec<String>,
+    pub last_event_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorvoEvent {
+    pub event_type: String,
+    pub id: String,
+    pub data: Value,
+}
+
 // --- Client implementation ---
 
 impl CorvoClient {
@@ -461,6 +476,132 @@ impl CorvoClient {
     pub async fn bulk_status(&self, id: &str) -> Result<BulkTask, CorvoError> {
         self.request::<BulkTask, Value>(reqwest::Method::GET, &format!("/api/v1/bulk/{id}"), None)
             .await
+    }
+
+    pub async fn bulk_get_jobs(&self, ids: Vec<String>) -> Result<Vec<Value>, CorvoError> {
+        #[derive(Serialize)]
+        struct Req {
+            job_ids: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            jobs: Vec<Value>,
+        }
+        let resp: Resp = self.post("/api/v1/jobs/bulk-get", &Req { job_ids: ids }).await?;
+        Ok(resp.jobs)
+    }
+
+    pub async fn subscribe(
+        &self,
+        options: SubscribeOptions,
+    ) -> Result<impl futures::Stream<Item = Result<CorvoEvent, CorvoError>>, CorvoError> {
+        use futures::StreamExt;
+
+        let mut params = Vec::new();
+        if !options.queues.is_empty() {
+            params.push(format!("queues={}", options.queues.join(",")));
+        }
+        if !options.job_ids.is_empty() {
+            params.push(format!("job_ids={}", options.job_ids.join(",")));
+        }
+        if !options.types.is_empty() {
+            params.push(format!("types={}", options.types.join(",")));
+        }
+        if let Some(id) = options.last_event_id {
+            params.push(format!("last_event_id={id}"));
+        }
+
+        let qs = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
+
+        let mut headers = HeaderMap::new();
+        for (k, v) in &self.auth.headers {
+            if let (Ok(name), Ok(val)) = (HeaderName::from_str(k), HeaderValue::from_str(v)) {
+                headers.insert(name, val);
+            }
+        }
+        if let Some(key) = &self.auth.api_key {
+            let h = self.auth.api_key_header.clone().unwrap_or_else(|| "X-API-Key".to_string());
+            if let (Ok(name), Ok(val)) = (HeaderName::from_str(&h), HeaderValue::from_str(key)) {
+                headers.insert(name, val);
+            }
+        }
+        if let Some(token) = &self.auth.bearer_token {
+            if let Ok(val) = HeaderValue::from_str(&format!("Bearer {token}")) {
+                headers.insert(AUTHORIZATION, val);
+            }
+        }
+
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/events{}", self.base_url, qs))
+            .headers(headers)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(CorvoError::Api(format!("SSE stream failed: HTTP {}", resp.status())));
+        }
+
+        let stream = resp.bytes_stream();
+        let event_stream = futures::stream::unfold(
+            (stream, String::new(), String::new(), String::new(), Vec::<String>::new()),
+            |(mut stream, mut buffer, mut ev_type, mut ev_id, mut data_lines)| async move {
+                loop {
+                    // Try to parse complete events from the buffer.
+                    while let Some(nl) = buffer.find('\n') {
+                        let line = buffer[..nl].trim_end_matches('\r').to_string();
+                        buffer = buffer[nl + 1..].to_string();
+
+                        if line.starts_with("event: ") {
+                            ev_type = line[7..].to_string();
+                        } else if line.starts_with("id: ") {
+                            ev_id = line[4..].to_string();
+                        } else if line.starts_with("data: ") {
+                            data_lines.push(line[6..].to_string());
+                        } else if line.is_empty() && !data_lines.is_empty() {
+                            let raw = data_lines.join("\n");
+                            data_lines.clear();
+                            let t = std::mem::take(&mut ev_type);
+                            let id = std::mem::take(&mut ev_id);
+                            if let Ok(data) = serde_json::from_str::<Value>(&raw) {
+                                let ev = CorvoEvent {
+                                    event_type: t,
+                                    id,
+                                    data,
+                                };
+                                return Some((Ok(ev), (stream, buffer, ev_type, ev_id, data_lines)));
+                            }
+                        } else if line.is_empty() {
+                            // keepalive or empty dispatch
+                            data_lines.clear();
+                            ev_type.clear();
+                            ev_id.clear();
+                        }
+                    }
+
+                    // Need more data from the stream.
+                    use futures::TryStreamExt;
+                    match stream.try_next().await {
+                        Ok(Some(chunk)) => {
+                            buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        }
+                        Ok(None) => return None,
+                        Err(e) => {
+                            return Some((
+                                Err(CorvoError::Http(e)),
+                                (stream, buffer, ev_type, ev_id, data_lines),
+                            ))
+                        }
+                    }
+                }
+            },
+        );
+
+        Ok(event_stream)
     }
 
     // -- Internal helpers --
