@@ -27,7 +27,7 @@ pub struct RpcAuthOptions {
 }
 
 const SDK_NAME: &str = "corvo-rust";
-const SDK_VERSION: &str = "0.2.0";
+const SDK_VERSION: &str = "0.3.0";
 
 fn build_metadata(auth: &RpcAuthOptions) -> MetadataMap {
     let mut map = MetadataMap::new();

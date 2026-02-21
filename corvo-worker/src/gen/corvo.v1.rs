@@ -261,6 +261,41 @@ pub struct HeartbeatResponse {
         HeartbeatJobResponse,
     >,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SubscribeRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub queues: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "2")]
+    pub job_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "3")]
+    pub types: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "4")]
+    pub last_event_id: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SubscribeEvent {
+    #[prost(uint64, tag = "1")]
+    pub seq: u64,
+    #[prost(string, tag = "2")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub job_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub queue: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub at_ns: u64,
+    #[prost(string, tag = "6")]
+    pub data_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GetServerInfoRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetServerInfoResponse {
+    #[prost(string, tag = "1")]
+    pub server_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub api_version: ::prost::alloc::string::String,
+}
 /// Generated client implementations.
 pub mod worker_service_client {
     #![allow(
@@ -535,6 +570,54 @@ pub mod worker_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("corvo.v1.WorkerService", "Heartbeat"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn subscribe(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SubscribeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::SubscribeEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/corvo.v1.WorkerService/Subscribe",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("corvo.v1.WorkerService", "Subscribe"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn get_server_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetServerInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetServerInfoResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/corvo.v1.WorkerService/GetServerInfo",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("corvo.v1.WorkerService", "GetServerInfo"));
             self.inner.unary(req, path, codec).await
         }
     }
