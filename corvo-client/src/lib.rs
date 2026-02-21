@@ -505,8 +505,6 @@ impl CorvoClient {
         &self,
         options: SubscribeOptions,
     ) -> Result<impl futures::Stream<Item = Result<CorvoEvent, CorvoError>>, CorvoError> {
-        use futures::StreamExt;
-
         let mut params = Vec::new();
         if !options.queues.is_empty() {
             params.push(format!("queues={}", options.queues.join(",")));
