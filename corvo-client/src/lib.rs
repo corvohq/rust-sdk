@@ -253,6 +253,12 @@ pub struct BulkTask {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerInfo {
+    pub server_version: String,
+    pub api_version: String,
+}
+
 #[derive(Debug, Default)]
 pub struct SubscribeOptions {
     pub queues: Vec<String>,
@@ -476,6 +482,10 @@ impl CorvoClient {
     pub async fn bulk_status(&self, id: &str) -> Result<BulkTask, CorvoError> {
         self.request::<BulkTask, Value>(reqwest::Method::GET, &format!("/api/v1/bulk/{id}"), None)
             .await
+    }
+
+    pub async fn get_server_info(&self) -> Result<ServerInfo, CorvoError> {
+        self.request::<ServerInfo, ()>(reqwest::Method::GET, "/api/v1/info", None).await
     }
 
     pub async fn bulk_get_jobs(&self, ids: Vec<String>) -> Result<Vec<Value>, CorvoError> {
