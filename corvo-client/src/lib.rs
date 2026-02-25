@@ -722,6 +722,13 @@ impl CorvoClient {
             }
             return Err(CorvoError::Api(msg));
         }
-        Ok(resp.json().await?)
+        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            return serde_json::from_str("{}").map_err(|e| CorvoError::Api(e.to_string()));
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.is_empty() {
+            return serde_json::from_str("{}").map_err(|e| CorvoError::Api(e.to_string()));
+        }
+        serde_json::from_slice(&bytes).map_err(|e| CorvoError::Api(format!("error decoding response body: {e}")))
     }
 }
