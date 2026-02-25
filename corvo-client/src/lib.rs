@@ -56,6 +56,8 @@ pub struct EnqueueOptions {
     pub expire_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain: Option<ChainConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -251,6 +253,16 @@ pub struct BulkTask {
     pub created_at: String,
     pub updated_at: String,
     pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateBatchResult {
+    pub batch_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SealBatchResult {
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -482,6 +494,31 @@ impl CorvoClient {
     pub async fn bulk_status(&self, id: &str) -> Result<BulkTask, CorvoError> {
         self.request::<BulkTask, Value>(reqwest::Method::GET, &format!("/api/v1/bulk/{id}"), None)
             .await
+    }
+
+    pub async fn create_batch(
+        &self,
+        callback_queue: &str,
+        callback_payload: Option<Value>,
+    ) -> Result<CreateBatchResult, CorvoError> {
+        #[derive(Serialize)]
+        struct Req {
+            callback_queue: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            callback_payload: Option<Value>,
+        }
+        self.post(
+            "/api/v1/batch",
+            &Req {
+                callback_queue: callback_queue.to_string(),
+                callback_payload,
+            },
+        )
+        .await
+    }
+
+    pub async fn seal_batch(&self, batch_id: &str) -> Result<SealBatchResult, CorvoError> {
+        self.post_empty(&format!("/api/v1/batch/{batch_id}/seal")).await
     }
 
     pub async fn get_server_info(&self) -> Result<ServerInfo, CorvoError> {
