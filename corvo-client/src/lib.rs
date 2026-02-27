@@ -199,6 +199,10 @@ pub struct SearchFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_contains: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order: Option<String>,
