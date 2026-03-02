@@ -16,6 +16,7 @@ tonic = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 http = "1"
+rand = "0.8"
 
 [build-dependencies]
 tonic-build = "0.12"

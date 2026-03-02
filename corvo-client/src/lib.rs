@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(thiserror::Error, Debug)]
 pub enum CorvoError {
@@ -26,12 +27,31 @@ pub struct AuthOptions {
     pub api_key_header: Option<String>,
 }
 
+/// Controls transient-error retry behavior.
+#[derive(Clone, Debug)]
+pub struct RetryConfig {
+    /// Maximum attempts (default 3). Set to 0 to disable retry.
+    pub max_attempts: u32,
+    /// Base delay between retries (default 1s), jittered ±25%.
+    pub base_delay: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay: Duration::from_secs(1),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CorvoClient {
     base_url: String,
     http: reqwest::Client,
     auth: AuthOptions,
     use_rpc: bool,
+    retry: RetryConfig,
 }
 
 // --- Request / Response types ---
@@ -299,6 +319,7 @@ impl CorvoClient {
             http: reqwest::Client::new(),
             auth: AuthOptions::default(),
             use_rpc: false,
+            retry: RetryConfig::default(),
         }
     }
 
@@ -309,6 +330,11 @@ impl CorvoClient {
 
     pub fn with_rpc(mut self, enabled: bool) -> Self {
         self.use_rpc = enabled;
+        self
+    }
+
+    pub fn with_retry(mut self, config: RetryConfig) -> Self {
+        self.retry = config;
         self
     }
 
@@ -702,37 +728,80 @@ impl CorvoClient {
             );
         }
 
-        let mut req = self
-            .http
-            .request(method, format!("{}{}", self.base_url, path))
-            .headers(headers);
-        if let Some(b) = body {
-            req = req.json(&b);
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            let msg = body
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("request failed")
-                .to_string();
-            let code = body
-                .get("code")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if code == "PAYLOAD_TOO_LARGE" {
-                return Err(CorvoError::PayloadTooLarge(msg));
+        // Serialize body once for reuse across retries.
+        let body_bytes: Option<Vec<u8>> = match &body {
+            Some(b) => Some(serde_json::to_vec(b).map_err(|e| CorvoError::Api(e.to_string()))?),
+            None => None,
+        };
+
+        let attempts = if self.retry.max_attempts > 0 { self.retry.max_attempts } else { 1 };
+        let mut last_err: Option<CorvoError> = None;
+
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                let jitter = 0.75 + rand::random::<f64>() * 0.5; // 0.75x–1.25x
+                let delay = Duration::from_secs_f64(self.retry.base_delay.as_secs_f64() * jitter);
+                tokio::time::sleep(delay).await;
             }
-            return Err(CorvoError::Api(msg));
+
+            let mut req = self
+                .http
+                .request(method.clone(), format!("{}{}", self.base_url, path))
+                .headers(headers.clone());
+            if let Some(ref bytes) = body_bytes {
+                req = req
+                    .header("content-type", "application/json")
+                    .body(reqwest::Body::from(bytes.clone()));
+            }
+
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if (e.is_connect() || e.is_timeout()) && attempt < attempts - 1 {
+                        last_err = Some(CorvoError::Http(e));
+                        continue;
+                    }
+                    return Err(CorvoError::Http(e));
+                }
+            };
+
+            let status = resp.status();
+            if status == reqwest::StatusCode::BAD_GATEWAY
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                last_err = Some(CorvoError::Api(format!("HTTP {}", status.as_u16())));
+                if attempt < attempts - 1 {
+                    continue;
+                }
+                return Err(last_err.unwrap());
+            }
+
+            if !status.is_success() {
+                let body: Value = resp.json().await.unwrap_or(Value::Null);
+                let msg = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed")
+                    .to_string();
+                let code = body
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if code == "PAYLOAD_TOO_LARGE" {
+                    return Err(CorvoError::PayloadTooLarge(msg));
+                }
+                return Err(CorvoError::Api(msg));
+            }
+            if status == reqwest::StatusCode::NO_CONTENT {
+                return serde_json::from_str("{}").map_err(|e| CorvoError::Api(e.to_string()));
+            }
+            let bytes = resp.bytes().await?;
+            if bytes.is_empty() {
+                return serde_json::from_str("{}").map_err(|e| CorvoError::Api(e.to_string()));
+            }
+            return serde_json::from_slice(&bytes).map_err(|e| CorvoError::Api(format!("error decoding response body: {e}")));
         }
-        if resp.status() == reqwest::StatusCode::NO_CONTENT {
-            return serde_json::from_str("{}").map_err(|e| CorvoError::Api(e.to_string()));
-        }
-        let bytes = resp.bytes().await?;
-        if bytes.is_empty() {
-            return serde_json::from_str("{}").map_err(|e| CorvoError::Api(e.to_string()));
-        }
-        serde_json::from_slice(&bytes).map_err(|e| CorvoError::Api(format!("error decoding response body: {e}")))
+        Err(last_err.unwrap_or_else(|| CorvoError::Api("request failed".to_string())))
     }
 }
