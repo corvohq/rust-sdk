@@ -97,9 +97,23 @@ pub struct ChainStep {
 
 #[derive(Debug, Deserialize)]
 pub struct EnqueueResult {
-    pub job_id: String,
-    pub status: String,
-    pub unique_existing: Option<bool>,
+    pub job: Option<serde_json::Value>,
+    #[serde(default)]
+    pub unique_existing: bool,
+    #[serde(default)]
+    pub unique_job_id: String,
+}
+
+impl EnqueueResult {
+    /// Convenience accessor: returns job ID from nested job or unique_job_id.
+    pub fn job_id(&self) -> &str {
+        if let Some(job) = &self.job {
+            if let Some(id) = job.get("id").and_then(|v| v.as_str()) {
+                return id;
+            }
+        }
+        &self.unique_job_id
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +157,13 @@ pub struct FetchedJob {
     pub queue: String,
     pub payload: Value,
     pub attempt: u32,
+    #[serde(default)]
+    pub max_retries: u32,
+    #[serde(default)]
+    pub lease_duration: u32,
+    pub checkpoint: Option<serde_json::Value>,
+    pub tags: Option<serde_json::Value>,
+    pub agent: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,8 +208,11 @@ struct FailRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct FailResult {
+    pub job: Option<serde_json::Value>,
     pub status: String,
-    pub attempt: Option<u32>,
+    pub next_attempt_at: Option<String>,
+    #[serde(default)]
+    pub attempts_remaining: u32,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -200,10 +224,16 @@ pub struct HeartbeatEntry {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct HeartbeatJobStatus {
+    pub status: String,
+    #[serde(default)]
+    pub budget_exceeded: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct HeartbeatResult {
-    pub acked: Vec<String>,
-    pub unknown: Vec<String>,
-    pub canceled: Vec<String>,
+    pub jobs: std::collections::HashMap<String, HeartbeatJobStatus>,
+    pub lease_expires_at: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -286,7 +316,7 @@ pub struct CreateBatchResult {
 
 #[derive(Debug, Deserialize)]
 pub struct SealBatchResult {
-    pub status: String,
+    pub callback_job: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

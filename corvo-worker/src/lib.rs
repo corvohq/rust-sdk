@@ -406,10 +406,12 @@ impl CorvoWorker {
                     entries.insert(id.clone(), HeartbeatEntry::default());
                 }
                 if let Ok(result) = hb_client.heartbeat(entries).await {
-                    for id in &result.canceled {
-                        for (job_id, flag) in &cancel_flags {
-                            if job_id == id {
-                                *flag.lock().await = true;
+                    for (id, status) in &result.jobs {
+                        if status.status == "cancel" {
+                            for (job_id, flag) in &cancel_flags {
+                                if job_id == id {
+                                    *flag.lock().await = true;
+                                }
                             }
                         }
                     }
@@ -540,10 +542,34 @@ fn proto_job_to_fetched(j: &gen::corvo::v1::FetchBatchJob) -> FetchedJob {
     } else {
         serde_json::from_str(&j.payload_json).unwrap_or(Value::Object(Default::default()))
     };
+    let checkpoint: Option<Value> = if j.checkpoint_json.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&j.checkpoint_json).ok()
+    };
+    let tags: Option<Value> = if j.tags_json.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&j.tags_json).ok()
+    };
+    let agent: Option<Value> = j.agent.as_ref().map(|a| {
+        serde_json::json!({
+            "max_iterations": a.max_iterations,
+            "max_cost_usd": a.max_cost_usd,
+            "iteration_timeout": &a.iteration_timeout,
+            "iteration": a.iteration,
+            "total_cost_usd": a.total_cost_usd,
+        })
+    });
     FetchedJob {
         job_id: j.job_id.clone(),
         queue: j.queue.clone(),
         payload,
         attempt: j.attempt as u32,
+        max_retries: j.max_retries as u32,
+        lease_duration: j.lease_duration as u32,
+        checkpoint,
+        tags,
+        agent,
     }
 }

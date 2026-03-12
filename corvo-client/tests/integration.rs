@@ -19,14 +19,14 @@ async fn test_job_lifecycle() {
         .enqueue("rust-test", json!({"hello": "world"}))
         .await
         .expect("enqueue failed");
-    assert!(!result.job_id.is_empty(), "expected non-empty job_id");
+    assert!(!result.job_id().is_empty(), "expected non-empty job_id");
 
     let job = client
         .fetch(vec!["rust-test".into()], "rust-integration-worker", "test-host", 5)
         .await
         .expect("fetch failed")
         .expect("expected a job");
-    assert_eq!(job.job_id, result.job_id);
+    assert_eq!(job.job_id, result.job_id());
     assert_eq!(job.payload["hello"], "world");
 
     client
@@ -34,7 +34,7 @@ async fn test_job_lifecycle() {
         .await
         .expect("ack failed");
 
-    let got = client.get_job(&result.job_id).await.expect("get_job failed");
+    let got = client.get_job(result.job_id()).await.expect("get_job failed");
     assert_eq!(got["state"], "completed", "expected completed, got {}", got["state"]);
 }
 
@@ -53,7 +53,7 @@ async fn test_enqueue_options() {
         .await
         .expect("enqueue failed");
 
-    let got = client.get_job(&result.job_id).await.expect("get_job failed");
+    let got = client.get_job(result.job_id()).await.expect("get_job failed");
     assert_eq!(got["priority"], 1, "expected priority=1 (high)");
     assert_eq!(got["max_retries"], 5, "expected max_retries=5");
 
@@ -126,7 +126,7 @@ async fn test_fail_and_retry() {
 
     client.ack(&job2.job_id, AckBody::default()).await.expect("ack failed");
 
-    let got = client.get_job(&result.job_id).await.expect("get_job failed");
+    let got = client.get_job(result.job_id()).await.expect("get_job failed");
     assert_eq!(got["state"], "completed", "expected completed, got {}", got["state"]);
 }
 
