@@ -1,5 +1,7 @@
-pub mod rpc;
-mod gen;
+pub mod conn;
+pub mod pool;
+
+pub use pool::{Client, ClientOptions};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,9 @@ pub enum CorvoError {
     /// Payload exceeded the server's configured limit. Not retryable.
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
+    /// Unique key conflict (HTTP 409). The existing job ID is in the field.
+    #[error("unique conflict: {0}")]
+    UniqueConflict { message: String, unique_job_id: String },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,7 +55,6 @@ pub struct CorvoClient {
     base_url: String,
     http: reqwest::Client,
     auth: AuthOptions,
-    use_rpc: bool,
     retry: RetryConfig,
 }
 
@@ -163,7 +167,6 @@ pub struct FetchedJob {
     pub lease_duration: u32,
     pub checkpoint: Option<serde_json::Value>,
     pub tags: Option<serde_json::Value>,
-    pub agent: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,8 +229,6 @@ pub struct HeartbeatEntry {
 #[derive(Debug, Deserialize)]
 pub struct HeartbeatJobStatus {
     pub status: String,
-    #[serde(default)]
-    pub budget_exceeded: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,18 +349,12 @@ impl CorvoClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             auth: AuthOptions::default(),
-            use_rpc: false,
             retry: RetryConfig::default(),
         }
     }
 
     pub fn with_auth(mut self, auth: AuthOptions) -> Self {
         self.auth = auth;
-        self
-    }
-
-    pub fn with_rpc(mut self, enabled: bool) -> Self {
-        self.use_rpc = enabled;
         self
     }
 
@@ -508,10 +503,6 @@ impl CorvoClient {
     pub async fn get_job(&self, job_id: &str) -> Result<Value, CorvoError> {
         self.request::<Value, Value>(reqwest::Method::GET, &format!("/api/v1/jobs/{job_id}"), None)
             .await
-    }
-
-    pub async fn retry_job(&self, job_id: &str) -> Result<Value, CorvoError> {
-        self.post_empty(&format!("/api/v1/jobs/{job_id}/retry")).await
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<Value, CorvoError> {
@@ -820,6 +811,14 @@ impl CorvoClient {
                     .unwrap_or("");
                 if code == "PAYLOAD_TOO_LARGE" {
                     return Err(CorvoError::PayloadTooLarge(msg));
+                }
+                if status == reqwest::StatusCode::CONFLICT {
+                    let unique_job_id = body
+                        .get("unique_job_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    return Err(CorvoError::UniqueConflict { message: msg, unique_job_id });
                 }
                 return Err(CorvoError::Api(msg));
             }
