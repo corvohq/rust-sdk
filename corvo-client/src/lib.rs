@@ -20,7 +20,7 @@ pub enum CorvoError {
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
     /// Unique key conflict (HTTP 409). The existing job ID is in the field.
-    #[error("unique conflict: {0}")]
+    #[error("unique conflict: {message}")]
     UniqueConflict { message: String, unique_job_id: String },
 }
 

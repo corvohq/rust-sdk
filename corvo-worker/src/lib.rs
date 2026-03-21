@@ -1,4 +1,5 @@
-use corvo_client::{AckBody, CorvoClient, CorvoError, FetchedJob, HeartbeatEntry};
+use corvo_client::conn::{AckJob, AckStatus, Conn, ConnError, FetchedJob as RpcFetchedJob};
+use corvo_client::{CorvoClient, CorvoError, HeartbeatEntry};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
@@ -15,6 +16,10 @@ pub struct WorkerConfig {
     pub hostname: Option<String>,
     pub concurrency: usize,
     pub shutdown_timeout: Duration,
+    /// RPC host for the binary protocol (default "127.0.0.1").
+    pub rpc_host: String,
+    /// RPC port for the binary protocol (default 7438).
+    pub rpc_port: u16,
 }
 
 impl Default for WorkerConfig {
@@ -25,6 +30,42 @@ impl Default for WorkerConfig {
             hostname: None,
             concurrency: 10,
             shutdown_timeout: Duration::from_secs(30),
+            rpc_host: "127.0.0.1".to_string(),
+            rpc_port: 7438,
+        }
+    }
+}
+
+/// A fetched job exposed to handler functions.
+///
+/// Wraps the binary RPC `FetchedJob` with a parsed JSON payload for
+/// ergonomic handler code.
+#[derive(Debug, Clone)]
+pub struct FetchedJob {
+    pub job_id: String,
+    pub queue: String,
+    pub attempt: u16,
+    pub max_retries: u16,
+    pub checkpoint: Vec<u8>,
+    pub tags: Vec<u8>,
+    pub payload: Value,
+}
+
+impl From<RpcFetchedJob> for FetchedJob {
+    fn from(rpc: RpcFetchedJob) -> Self {
+        let payload = if rpc.payload.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&rpc.payload).unwrap_or(Value::Null)
+        };
+        Self {
+            job_id: rpc.id,
+            queue: rpc.queue,
+            attempt: rpc.attempt,
+            max_retries: rpc.max_retries,
+            checkpoint: rpc.checkpoint,
+            tags: rpc.tags,
+            payload,
         }
     }
 }
@@ -74,7 +115,11 @@ impl JobContext {
 type BoxFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send + 'a>>;
 type HandlerFn = Arc<dyn Fn(FetchedJob, Arc<JobContext>) -> BoxFuture<'static> + Send + Sync>;
 
-/// A Corvo worker that fetches and processes jobs.
+/// A Corvo worker that fetches and processes jobs using the bidi streaming
+/// binary RPC protocol.
+///
+/// Each concurrency slot opens a dedicated `Conn` and uses subscribe +
+/// read_pushed_jobs for efficient push-based job delivery.
 pub struct CorvoWorker {
     client: CorvoClient,
     config: WorkerConfig,
@@ -83,6 +128,10 @@ pub struct CorvoWorker {
 
 impl CorvoWorker {
     /// Creates a new worker with the given client and configuration.
+    ///
+    /// The `client` is used for heartbeat RPCs (HTTP). Job fetch and ack
+    /// use the binary RPC protocol via `Conn` connections to
+    /// `config.rpc_host:config.rpc_port`.
     pub fn new(client: CorvoClient, config: WorkerConfig) -> Self {
         Self {
             client,
@@ -105,12 +154,6 @@ impl CorvoWorker {
 
     /// Starts the worker. Blocks until SIGINT/SIGTERM, then drains gracefully.
     pub async fn start(&self) -> Result<(), CorvoError> {
-        let hostname = self
-            .config
-            .hostname
-            .clone()
-            .unwrap_or_else(|| gethostname().unwrap_or_else(|| "unknown".to_string()));
-
         let active_jobs: Arc<Mutex<HashMap<String, Arc<Mutex<bool>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let stopping = Arc::new(Mutex::new(false));
@@ -160,69 +203,143 @@ impl CorvoWorker {
             }
         });
 
-        // Spawn fetch loop tasks.
+        // Spawn fetch loop tasks -- one per concurrency slot.
         let mut fetch_handles = Vec::new();
         for _ in 0..self.config.concurrency {
             let client = self.client.clone();
+            let rpc_host = self.config.rpc_host.clone();
+            let rpc_port = self.config.rpc_port;
             let queues = self.config.queues.clone();
             let worker_id = self.config.worker_id.clone();
-            let hostname = hostname.clone();
             let active = active_jobs.clone();
             let stopping = stopping.clone();
             let stop_notify = stop_notify.clone();
             let handlers = handlers.clone();
 
             let handle = tokio::spawn(async move {
+                let queue_refs: Vec<&str> = queues.iter().map(|s| s.as_str()).collect();
+                let credits: u16 = 1;
+
+                let mut conn = Conn::new(&rpc_host, rpc_port).await;
+
                 loop {
                     if *stopping.lock().await {
+                        conn.close().await;
                         return;
                     }
 
-                    let job = match client
-                        .fetch(queues.clone(), &worker_id, &hostname, 30)
-                        .await
-                    {
-                        Ok(Some(job)) => job,
-                        Ok(None) => continue,
-                        Err(_) => {
+                    // Subscribe with credits.
+                    if let Err(e) = conn.subscribe(&queue_refs, &worker_id, credits).await {
+                        tracing::warn!("subscribe error: {e}, reconnecting");
+                        if let Err(re) = conn.reconnect().await {
+                            tracing::warn!("reconnect failed: {re}");
                             tokio::select! {
                                 _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
-                                _ = stop_notify.notified() => return,
+                                _ = stop_notify.notified() => {
+                                    conn.close().await;
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Read pushed jobs (blocks until server pushes).
+                    let rpc_jobs = match conn.read_pushed_jobs().await {
+                        Ok(jobs) => jobs,
+                        Err(ConnError::Io(_)) => {
+                            tracing::warn!("connection lost, reconnecting");
+                            if let Err(re) = conn.reconnect().await {
+                                tracing::warn!("reconnect failed: {re}");
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                                    _ = stop_notify.notified() => {
+                                        conn.close().await;
+                                        return;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!("read_pushed_jobs error: {e}");
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                                _ = stop_notify.notified() => {
+                                    conn.close().await;
+                                    return;
+                                }
                             }
                         }
                     };
 
-                    let handler = match handlers.get(&job.queue) {
-                        Some(h) => h.clone(),
-                        None => {
-                            let _ = client.ack(&job.job_id, AckBody::default()).await;
-                            continue;
+                    if rpc_jobs.is_empty() {
+                        continue;
+                    }
+
+                    // Process each job and collect acks.
+                    let mut acks: Vec<AckJob> = Vec::with_capacity(rpc_jobs.len());
+
+                    for rpc_job in rpc_jobs {
+                        let job: FetchedJob = rpc_job.into();
+                        let job_queue = job.queue.clone();
+                        let job_id = job.job_id.clone();
+
+                        let handler = match handlers.get(&job_queue) {
+                            Some(h) => h.clone(),
+                            None => {
+                                // No handler registered: ack immediately.
+                                acks.push(AckJob {
+                                    job_id,
+                                    queue: job_queue,
+                                    ack_status: AckStatus::Done,
+                                    result: String::new(),
+                                    checkpoint: String::new(),
+                                    hold_reason: String::new(),
+                                });
+                                continue;
+                            }
+                        };
+
+                        let cancelled = Arc::new(Mutex::new(false));
+                        active
+                            .lock()
+                            .await
+                            .insert(job_id.clone(), cancelled.clone());
+
+                        let ctx = Arc::new(JobContext {
+                            job_id: job_id.clone(),
+                            client: client.clone(),
+                            cancelled,
+                        });
+
+                        let result = handler(job, ctx).await;
+                        active.lock().await.remove(&job_id);
+
+                        match result {
+                            Ok(()) => {
+                                acks.push(AckJob {
+                                    job_id,
+                                    queue: job_queue,
+                                    ack_status: AckStatus::Done,
+                                    result: String::new(),
+                                    checkpoint: String::new(),
+                                    hold_reason: String::new(),
+                                });
+                            }
+                            Err(e) => {
+                                // Use fail via HTTP client for proper retry handling.
+                                let _ = client.fail(&job_id, &e.to_string(), "").await;
+                            }
                         }
-                    };
+                    }
 
-                    let cancelled = Arc::new(Mutex::new(false));
-                    active
-                        .lock()
-                        .await
-                        .insert(job.job_id.clone(), cancelled.clone());
-
-                    let ctx = Arc::new(JobContext {
-                        job_id: job.job_id.clone(),
-                        client: client.clone(),
-                        cancelled,
-                    });
-
-                    let job_id = job.job_id.clone();
-                    let result = handler(job, ctx).await;
-
-                    active.lock().await.remove(&job_id);
-
-                    match result {
-                        Ok(()) => {
-                            let _ = client.ack(&job_id, AckBody::default()).await;
-                        }
-                        Err(e) => {
-                            let _ = client.fail(&job_id, &e.to_string(), "").await;
+                    // Send acks via binary RPC.
+                    if !acks.is_empty() {
+                        if let Err(e) = conn.ack_batch(&acks).await {
+                            tracing::warn!("ack_batch error: {e}");
+                            // Reconnect on next iteration.
+                            let _ = conn.reconnect().await;
                         }
                     }
                 }
@@ -272,8 +389,3 @@ impl CorvoWorker {
         Ok(())
     }
 }
-
-fn gethostname() -> Option<String> {
-    hostname::get().ok().and_then(|h| h.into_string().ok())
-}
-
