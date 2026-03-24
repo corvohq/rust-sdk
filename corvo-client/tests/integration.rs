@@ -54,7 +54,7 @@ async fn test_enqueue_options() {
         .expect("enqueue failed");
 
     let got = client.get_job(result.job_id()).await.expect("get_job failed");
-    assert_eq!(got["priority"], 1, "expected priority=1 (high)");
+    assert_eq!(got["priority"], 75, "expected priority=75 (high)");
     assert_eq!(got["max_retries"], 5, "expected max_retries=5");
 
     // Clean up

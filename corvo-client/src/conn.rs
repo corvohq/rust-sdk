@@ -8,7 +8,6 @@
 //! (e.g., request `0x01` -> response `0x81`).
 
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -221,7 +220,7 @@ impl Conn {
     /// Enqueue a batch of jobs.
     ///
     /// Wire format:
-    ///   [count:u16][now_ns:u64]
+    ///   [count:u16]
     ///   per job:
     ///     [queue:lenPrefixed(u8)][id:lenPrefixed(u8)][priority:u8][max_retries:u16]
     ///     [backoff:u8][base_delay_ms:u32][max_delay_ms:u32]
@@ -242,11 +241,9 @@ impl Conn {
         jobs: &[EnqueueJob],
     ) -> Result<u32, ConnError> {
         let count = jobs.len() as u16;
-        let now_ns = nanos_now();
 
         self.send_buf.clear();
         write_u16(&mut self.send_buf, count);
-        write_u64(&mut self.send_buf, now_ns);
 
         for job in jobs {
             write_len_prefixed(&mut self.send_buf, job.queue.as_bytes());
@@ -347,7 +344,7 @@ impl Conn {
     /// To replenish credits, call `subscribe` again.
     ///
     /// Wire format:
-    ///   [now_ns:u64][credits:u16][lease_ms:u32][worker_id:lenPrefixed]
+    ///   [credits:u16][lease_ms:u32][worker_id:lenPrefixed]
     ///   [queue_count:u8][queues:lenPrefixed...]
     pub async fn subscribe(
         &mut self,
@@ -355,10 +352,7 @@ impl Conn {
         worker_id: &str,
         credits: u16,
     ) -> Result<(), ConnError> {
-        let now_ns = nanos_now();
-
         self.send_buf.clear();
-        write_u64(&mut self.send_buf, now_ns);
         write_u16(&mut self.send_buf, credits);
         write_u32(&mut self.send_buf, DEFAULT_LEASE_MS);
         write_len_prefixed(&mut self.send_buf, worker_id.as_bytes());
@@ -394,7 +388,7 @@ impl Conn {
     /// Acknowledge a batch of jobs.
     ///
     /// Wire format:
-    ///   [now_ns:u64][count:u16]
+    ///   [count:u16]
     ///   per ack:
     ///     [job_id:lenPrefixed][queue:lenPrefixed]
     ///     [ack_status:u8][flags:u8]
@@ -405,10 +399,7 @@ impl Conn {
         &mut self,
         acks: &[AckJob],
     ) -> Result<(), ConnError> {
-        let now_ns = nanos_now();
-
         self.send_buf.clear();
-        write_u64(&mut self.send_buf, now_ns);
         write_u16(&mut self.send_buf, acks.len() as u16);
 
         for ack in acks {
@@ -463,7 +454,7 @@ impl Conn {
     /// Fail a batch of jobs.
     ///
     /// Wire format:
-    ///   [now_ns:u64][count:u16]
+    ///   [count:u16]
     ///   per job:
     ///     [job_id:lenPrefixed][queue:lenPrefixed]
     ///     [error_msg:lenPrefixed][backtrace:lenPrefixed]
@@ -471,10 +462,7 @@ impl Conn {
         &mut self,
         jobs: &[FailJob],
     ) -> Result<(), ConnError> {
-        let now_ns = nanos_now();
-
         self.send_buf.clear();
-        write_u64(&mut self.send_buf, now_ns);
         write_u16(&mut self.send_buf, jobs.len() as u16);
 
         for job in jobs {
@@ -742,13 +730,3 @@ impl<'a> BufReader<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Time helper
-// ---------------------------------------------------------------------------
-
-fn nanos_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
