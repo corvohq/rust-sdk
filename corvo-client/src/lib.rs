@@ -408,7 +408,7 @@ impl CorvoClient {
         jobs: Vec<BatchJob>,
         batch: Option<BatchConfig>,
     ) -> Result<BatchResult, CorvoError> {
-        self.post("/api/v1/enqueue/batch", &BatchRequest { jobs, batch }).await
+        self.post("/api/v1/enqueue", &BatchRequest { jobs, batch }).await
     }
 
     // -- Batch fetch / ack --

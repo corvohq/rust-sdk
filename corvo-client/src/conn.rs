@@ -574,22 +574,25 @@ impl Conn {
 
     // -- Frame I/O -----------------------------------------------------------
 
-    /// Write the 9-byte frame header + payload from `self.send_buf`.
+    /// Write the 9-byte frame header + payload from `self.send_buf` as a
+    /// single contiguous TCP write. With TCP_NODELAY, separate writes would
+    /// each become their own TCP segment, causing partial-frame reads on the
+    /// server (io_uring completes recv on the 9-byte header alone).
     async fn send_frame(&mut self, msg_type: u8) -> Result<(), ConnError> {
         let stream = self.stream.as_mut().ok_or(ConnError::NotConnected)?;
 
         self.req_id = self.req_id.wrapping_add(1);
         let payload_len = self.send_buf.len() as u32;
 
-        let mut header = [0u8; FRAME_HEADER_SIZE];
-        header[0] = msg_type;
-        header[1..5].copy_from_slice(&self.req_id.to_le_bytes());
-        header[5..9].copy_from_slice(&payload_len.to_le_bytes());
+        // Build contiguous frame: header + payload in one allocation.
+        let frame_len = FRAME_HEADER_SIZE + self.send_buf.len();
+        let mut frame = Vec::with_capacity(frame_len);
+        frame.push(msg_type);
+        frame.extend_from_slice(&self.req_id.to_le_bytes());
+        frame.extend_from_slice(&payload_len.to_le_bytes());
+        frame.extend_from_slice(&self.send_buf);
 
-        stream.write_all(&header).await?;
-        if !self.send_buf.is_empty() {
-            stream.write_all(&self.send_buf).await?;
-        }
+        stream.write_all(&frame).await?;
         stream.flush().await?;
         Ok(())
     }
