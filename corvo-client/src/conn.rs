@@ -35,6 +35,12 @@ const MSG_HEARTBEAT_RESP: u8 = 0x86;
 const MSG_FAIL_BATCH_RESP: u8 = 0x87;
 const MSG_ERROR: u8 = 0xFF;
 
+const MSG_CANCEL_SIGNAL: u8 = 0x08; // server -> client push
+
+// Bulk action request/response.
+const MSG_BULK_ACTION: u8 = 0x14;
+const MSG_BULK_ACTION_RESP: u8 = 0x94;
+
 const DEFAULT_LEASE_MS: u32 = 30_000;
 
 // Enqueue job flags bitmask.
@@ -161,6 +167,22 @@ pub struct FetchedJob {
     pub checkpoint: Vec<u8>,
     pub tags: Vec<u8>,
     pub payload: Vec<u8>,
+}
+
+/// A frame received from the server in the message loop.
+/// Use [`Conn::read_frame`] after [`Conn::subscribe`] to receive these.
+#[derive(Debug)]
+pub enum Frame {
+    /// Pushed jobs from subscription.
+    FetchResp(Vec<FetchedJob>),
+    /// Ack confirmation with affected count.
+    AckResp(u16),
+    /// Fail confirmation with affected count.
+    FailResp(u16),
+    /// Server cancelled active jobs — contains cancelled job IDs.
+    CancelSignal(Vec<String>),
+    /// Pong response.
+    Pong,
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +405,137 @@ impl Conn {
         }
 
         decode_fetch_response(payload)
+    }
+
+    /// Read the next frame from the server, dispatching by message type.
+    ///
+    /// Use in a message loop after [`subscribe`] to handle interleaved
+    /// FETCH_RESP, ACK_RESP, FAIL_RESP, and CANCEL_SIGNAL frames.
+    pub async fn read_frame(&mut self) -> Result<Frame, ConnError> {
+        let (msg_type, payload) = self.recv_frame().await?;
+
+        match msg_type {
+            MSG_FETCH_BATCH_RESP => {
+                let jobs = decode_fetch_response(payload)?;
+                Ok(Frame::FetchResp(jobs))
+            }
+            MSG_ACK_BATCH_RESP => {
+                let mut r = BufReader::new(payload);
+                let affected = r.read_u16().unwrap_or(0);
+                Ok(Frame::AckResp(affected))
+            }
+            MSG_FAIL_BATCH_RESP => {
+                let mut r = BufReader::new(payload);
+                let affected = r.read_u16().unwrap_or(0);
+                Ok(Frame::FailResp(affected))
+            }
+            MSG_CANCEL_SIGNAL => {
+                let mut r = BufReader::new(payload);
+                let count = r.read_u16().unwrap_or(0);
+                let mut ids = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    match r.read_len_prefixed() {
+                        Ok(id_bytes) => ids.push(String::from_utf8_lossy(id_bytes).to_string()),
+                        Err(_) => break,
+                    }
+                }
+                Ok(Frame::CancelSignal(ids))
+            }
+            MSG_PONG => Ok(Frame::Pong),
+            MSG_ERROR => {
+                Err(ConnError::Server(
+                    String::from_utf8_lossy(payload).to_string(),
+                ))
+            }
+            _ => Err(ConnError::UnexpectedResponse(msg_type)),
+        }
+    }
+
+    /// Send ack batch without waiting for response (fire-and-forget).
+    ///
+    /// The response will arrive via [`read_frame`] as [`Frame::AckResp`].
+    pub async fn send_ack(&mut self, acks: &[AckJob]) -> Result<(), ConnError> {
+        self.send_buf.clear();
+        write_u16(&mut self.send_buf, acks.len() as u16);
+
+        for ack in acks {
+            write_len_prefixed(&mut self.send_buf, ack.job_id.as_bytes());
+            write_len_prefixed(&mut self.send_buf, ack.queue.as_bytes());
+            self.send_buf.push(ack.ack_status as u8);
+
+            let mut flags: u8 = 0;
+            if !ack.result.is_empty() {
+                flags |= ACK_FLAG_RESULT;
+            }
+            if !ack.checkpoint.is_empty() {
+                flags |= ACK_FLAG_CHECKPOINT;
+            }
+            if !ack.hold_reason.is_empty() {
+                flags |= ACK_FLAG_HOLD_REASON;
+            }
+            self.send_buf.push(flags);
+
+            if flags & ACK_FLAG_RESULT != 0 {
+                write_len_prefixed(&mut self.send_buf, ack.result.as_bytes());
+            }
+            if flags & ACK_FLAG_CHECKPOINT != 0 {
+                write_len_prefixed(&mut self.send_buf, ack.checkpoint.as_bytes());
+            }
+            if flags & ACK_FLAG_HOLD_REASON != 0 {
+                write_len_prefixed(&mut self.send_buf, ack.hold_reason.as_bytes());
+            }
+        }
+
+        self.send_frame(MSG_ACK_BATCH).await
+    }
+
+    /// Send fail batch without waiting for response (fire-and-forget).
+    ///
+    /// The response will arrive via [`read_frame`] as [`Frame::FailResp`].
+    pub async fn send_fail(&mut self, jobs: &[FailJob]) -> Result<(), ConnError> {
+        self.send_buf.clear();
+        write_u16(&mut self.send_buf, jobs.len() as u16);
+
+        for job in jobs {
+            write_len_prefixed(&mut self.send_buf, job.job_id.as_bytes());
+            write_len_prefixed(&mut self.send_buf, job.queue.as_bytes());
+            write_len_prefixed(&mut self.send_buf, job.error.as_bytes());
+            write_len_prefixed(&mut self.send_buf, job.backtrace.as_bytes());
+        }
+
+        self.send_frame(MSG_FAIL_BATCH).await
+    }
+
+    /// Cancel jobs by ID via MSG_BULK_ACTION. Waits for server confirmation.
+    ///
+    /// Returns the number of jobs cancelled.
+    pub async fn cancel(&mut self, job_ids: &[&str]) -> Result<u16, ConnError> {
+        self.send_buf.clear();
+        // Wire: [action:u8][queue:lenPrefixed][count:u16][{id:lenPrefixed}...][flags:u8][now_ns:u64]
+        self.send_buf.push(3); // BulkAction.cancel = 3
+        write_len_prefixed(&mut self.send_buf, b""); // queue (empty)
+        write_u16(&mut self.send_buf, job_ids.len() as u16);
+        for id in job_ids {
+            write_len_prefixed(&mut self.send_buf, id.as_bytes());
+        }
+        self.send_buf.push(0); // flags
+        write_u64(&mut self.send_buf, 0); // now_ns (server uses its own clock)
+
+        self.send_frame(MSG_BULK_ACTION).await?;
+        let (msg_type, payload) = self.recv_frame().await?;
+
+        if msg_type == MSG_ERROR {
+            return Err(ConnError::Server(
+                String::from_utf8_lossy(payload).to_string(),
+            ));
+        }
+        if msg_type != MSG_BULK_ACTION_RESP {
+            return Err(ConnError::UnexpectedResponse(msg_type));
+        }
+
+        let mut r = BufReader::new(payload);
+        let affected = r.read_u16().unwrap_or(0);
+        Ok(affected)
     }
 
     /// Acknowledge a batch of jobs.
