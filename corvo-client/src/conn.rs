@@ -57,6 +57,7 @@ const FLAG_PARENT_ID: u16 = 0x0080;
 const ACK_FLAG_RESULT: u8 = 0x01;
 const ACK_FLAG_CHECKPOINT: u8 = 0x02;
 const ACK_FLAG_HOLD_REASON: u8 = 0x04;
+const ACK_FLAG_LEASE_TOKEN: u8 = 0x08;
 
 // Heartbeat flags bitmask.
 const HB_FLAG_PROGRESS: u8 = 0x01;
@@ -137,6 +138,7 @@ pub struct AckJob {
     pub result: String,
     pub checkpoint: String,
     pub hold_reason: String,
+    pub lease_token: u64,
 }
 
 /// A job failure report.
@@ -146,6 +148,7 @@ pub struct FailJob {
     pub queue: String,
     pub error: String,
     pub backtrace: String,
+    pub lease_token: u64,
 }
 
 /// A heartbeat update for a job.
@@ -167,6 +170,7 @@ pub struct FetchedJob {
     pub checkpoint: Vec<u8>,
     pub tags: Vec<u8>,
     pub payload: Vec<u8>,
+    pub lease_token: u64,
 }
 
 /// A frame received from the server in the message loop.
@@ -456,36 +460,7 @@ impl Conn {
     /// The response will arrive via [`read_frame`] as [`Frame::AckResp`].
     pub async fn send_ack(&mut self, acks: &[AckJob]) -> Result<(), ConnError> {
         self.send_buf.clear();
-        write_u16(&mut self.send_buf, acks.len() as u16);
-
-        for ack in acks {
-            write_len_prefixed(&mut self.send_buf, ack.job_id.as_bytes());
-            write_len_prefixed(&mut self.send_buf, ack.queue.as_bytes());
-            self.send_buf.push(ack.ack_status as u8);
-
-            let mut flags: u8 = 0;
-            if !ack.result.is_empty() {
-                flags |= ACK_FLAG_RESULT;
-            }
-            if !ack.checkpoint.is_empty() {
-                flags |= ACK_FLAG_CHECKPOINT;
-            }
-            if !ack.hold_reason.is_empty() {
-                flags |= ACK_FLAG_HOLD_REASON;
-            }
-            self.send_buf.push(flags);
-
-            if flags & ACK_FLAG_RESULT != 0 {
-                write_len_prefixed(&mut self.send_buf, ack.result.as_bytes());
-            }
-            if flags & ACK_FLAG_CHECKPOINT != 0 {
-                write_len_prefixed(&mut self.send_buf, ack.checkpoint.as_bytes());
-            }
-            if flags & ACK_FLAG_HOLD_REASON != 0 {
-                write_len_prefixed(&mut self.send_buf, ack.hold_reason.as_bytes());
-            }
-        }
-
+        encode_ack_payload(&mut self.send_buf, acks);
         self.send_frame(MSG_ACK_BATCH).await
     }
 
@@ -494,15 +469,7 @@ impl Conn {
     /// The response will arrive via [`read_frame`] as [`Frame::FailResp`].
     pub async fn send_fail(&mut self, jobs: &[FailJob]) -> Result<(), ConnError> {
         self.send_buf.clear();
-        write_u16(&mut self.send_buf, jobs.len() as u16);
-
-        for job in jobs {
-            write_len_prefixed(&mut self.send_buf, job.job_id.as_bytes());
-            write_len_prefixed(&mut self.send_buf, job.queue.as_bytes());
-            write_len_prefixed(&mut self.send_buf, job.error.as_bytes());
-            write_len_prefixed(&mut self.send_buf, job.backtrace.as_bytes());
-        }
-
+        encode_fail_payload(&mut self.send_buf, jobs);
         self.send_frame(MSG_FAIL_BATCH).await
     }
 
@@ -548,40 +515,13 @@ impl Conn {
     ///     if flags & 0x01: [result:lenPrefixed]
     ///     if flags & 0x02: [checkpoint:lenPrefixed]
     ///     if flags & 0x04: [hold_reason:lenPrefixed]
+    ///     if flags & 0x08: [lease_token:u64LE]
     pub async fn ack_batch(
         &mut self,
         acks: &[AckJob],
     ) -> Result<(), ConnError> {
         self.send_buf.clear();
-        write_u16(&mut self.send_buf, acks.len() as u16);
-
-        for ack in acks {
-            write_len_prefixed(&mut self.send_buf, ack.job_id.as_bytes());
-            write_len_prefixed(&mut self.send_buf, ack.queue.as_bytes());
-            self.send_buf.push(ack.ack_status as u8);
-
-            let mut flags: u8 = 0;
-            if !ack.result.is_empty() {
-                flags |= ACK_FLAG_RESULT;
-            }
-            if !ack.checkpoint.is_empty() {
-                flags |= ACK_FLAG_CHECKPOINT;
-            }
-            if !ack.hold_reason.is_empty() {
-                flags |= ACK_FLAG_HOLD_REASON;
-            }
-            self.send_buf.push(flags);
-
-            if flags & ACK_FLAG_RESULT != 0 {
-                write_len_prefixed(&mut self.send_buf, ack.result.as_bytes());
-            }
-            if flags & ACK_FLAG_CHECKPOINT != 0 {
-                write_len_prefixed(&mut self.send_buf, ack.checkpoint.as_bytes());
-            }
-            if flags & ACK_FLAG_HOLD_REASON != 0 {
-                write_len_prefixed(&mut self.send_buf, ack.hold_reason.as_bytes());
-            }
-        }
+        encode_ack_payload(&mut self.send_buf, acks);
 
         self.send_frame(MSG_ACK_BATCH).await?;
         let (msg_type, payload) = self.recv_frame().await?;
@@ -611,19 +551,13 @@ impl Conn {
     ///   per job:
     ///     [job_id:lenPrefixed][queue:lenPrefixed]
     ///     [error_msg:lenPrefixed][backtrace:lenPrefixed]
+    ///     [flags:u8][if flags & 0x01: lease_token:u64LE]
     pub async fn fail_batch(
         &mut self,
         jobs: &[FailJob],
     ) -> Result<(), ConnError> {
         self.send_buf.clear();
-        write_u16(&mut self.send_buf, jobs.len() as u16);
-
-        for job in jobs {
-            write_len_prefixed(&mut self.send_buf, job.job_id.as_bytes());
-            write_len_prefixed(&mut self.send_buf, job.queue.as_bytes());
-            write_len_prefixed(&mut self.send_buf, job.error.as_bytes());
-            write_len_prefixed(&mut self.send_buf, job.backtrace.as_bytes());
-        }
+        encode_fail_payload(&mut self.send_buf, jobs);
 
         self.send_frame(MSG_FAIL_BATCH).await?;
         let (msg_type, payload) = self.recv_frame().await?;
@@ -792,6 +726,7 @@ fn decode_fetch_response(payload: &[u8]) -> Result<Vec<FetchedJob>, ConnError> {
         let tags = r.read_len_prefixed()?;
         let payload_len = r.read_u16()? as usize;
         let payload_bytes = r.read_bytes(payload_len)?;
+        let lease_token = r.read_u64()?;
 
         jobs.push(FetchedJob {
             id: String::from_utf8_lossy(id).to_string(),
@@ -801,6 +736,7 @@ fn decode_fetch_response(payload: &[u8]) -> Result<Vec<FetchedJob>, ConnError> {
             checkpoint: checkpoint.to_vec(),
             tags: tags.to_vec(),
             payload: payload_bytes.to_vec(),
+            lease_token,
         });
     }
 
@@ -868,6 +804,24 @@ impl<'a> BufReader<'a> {
         Ok(v)
     }
 
+    fn read_u64(&mut self) -> Result<u64, ConnError> {
+        if self.pos + 8 > self.data.len() {
+            return Err(ConnError::Protocol("short read: u64".to_string()));
+        }
+        let v = u64::from_le_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+            self.data[self.pos + 4],
+            self.data[self.pos + 5],
+            self.data[self.pos + 6],
+            self.data[self.pos + 7],
+        ]);
+        self.pos += 8;
+        Ok(v)
+    }
+
     fn read_len_prefixed(&mut self) -> Result<&'a [u8], ConnError> {
         let len = self.read_u8()? as usize;
         self.read_bytes(len)
@@ -883,6 +837,448 @@ impl<'a> BufReader<'a> {
         let data = &self.data[self.pos..self.pos + len];
         self.pos += len;
         Ok(data)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extracted encoding helpers (used by Conn methods and tests)
+// ---------------------------------------------------------------------------
+
+/// Encode an ack batch payload into `buf`.
+///
+/// Wire format:
+///   [count:u16]
+///   per ack:
+///     [job_id:lenPrefixed][queue:lenPrefixed]
+///     [ack_status:u8][flags:u8]
+///     if flags & 0x01: [result:lenPrefixed]
+///     if flags & 0x02: [checkpoint:lenPrefixed]
+///     if flags & 0x04: [hold_reason:lenPrefixed]
+///     if flags & 0x08: [lease_token:u64LE]
+fn encode_ack_payload(buf: &mut Vec<u8>, acks: &[AckJob]) {
+    write_u16(buf, acks.len() as u16);
+
+    for ack in acks {
+        write_len_prefixed(buf, ack.job_id.as_bytes());
+        write_len_prefixed(buf, ack.queue.as_bytes());
+        buf.push(ack.ack_status as u8);
+
+        let mut flags: u8 = 0;
+        if !ack.result.is_empty() {
+            flags |= ACK_FLAG_RESULT;
+        }
+        if !ack.checkpoint.is_empty() {
+            flags |= ACK_FLAG_CHECKPOINT;
+        }
+        if !ack.hold_reason.is_empty() {
+            flags |= ACK_FLAG_HOLD_REASON;
+        }
+        if ack.lease_token != 0 {
+            flags |= ACK_FLAG_LEASE_TOKEN;
+        }
+        buf.push(flags);
+
+        if flags & ACK_FLAG_RESULT != 0 {
+            write_len_prefixed(buf, ack.result.as_bytes());
+        }
+        if flags & ACK_FLAG_CHECKPOINT != 0 {
+            write_len_prefixed(buf, ack.checkpoint.as_bytes());
+        }
+        if flags & ACK_FLAG_HOLD_REASON != 0 {
+            write_len_prefixed(buf, ack.hold_reason.as_bytes());
+        }
+        if flags & ACK_FLAG_LEASE_TOKEN != 0 {
+            write_u64(buf, ack.lease_token);
+        }
+    }
+}
+
+/// Encode a fail batch payload into `buf`.
+///
+/// Wire format:
+///   [count:u16]
+///   per job:
+///     [job_id:lenPrefixed][queue:lenPrefixed]
+///     [error_msg:lenPrefixed][backtrace:lenPrefixed]
+///     [flags:u8][if flags & 0x01: lease_token:u64LE]
+fn encode_fail_payload(buf: &mut Vec<u8>, jobs: &[FailJob]) {
+    write_u16(buf, jobs.len() as u16);
+
+    for job in jobs {
+        write_len_prefixed(buf, job.job_id.as_bytes());
+        write_len_prefixed(buf, job.queue.as_bytes());
+        write_len_prefixed(buf, job.error.as_bytes());
+        write_len_prefixed(buf, job.backtrace.as_bytes());
+
+        let flags: u8 = if job.lease_token != 0 { 0x01 } else { 0x00 };
+        buf.push(flags);
+        if flags & 0x01 != 0 {
+            write_u64(buf, job.lease_token);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a raw fetch-response payload for a single job with the given fields.
+    fn build_fetch_response(
+        id: &str,
+        queue: &str,
+        attempt: u16,
+        max_retries: u16,
+        checkpoint: &[u8],
+        tags: &[u8],
+        payload: &[u8],
+        lease_token: u64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // count = 1
+        write_u16(&mut buf, 1);
+        write_len_prefixed(&mut buf, id.as_bytes());
+        write_len_prefixed(&mut buf, queue.as_bytes());
+        write_u16(&mut buf, attempt);
+        write_u16(&mut buf, max_retries);
+        write_len_prefixed(&mut buf, checkpoint);
+        write_len_prefixed(&mut buf, tags);
+        // payload is u16-prefixed
+        write_u16(&mut buf, payload.len() as u16);
+        buf.extend_from_slice(payload);
+        write_u64(&mut buf, lease_token);
+        buf
+    }
+
+    // -- Fetch response parsing -----------------------------------------------
+
+    #[test]
+    fn decode_fetch_response_with_lease_token() {
+        let token: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let raw = build_fetch_response(
+            "job-1",
+            "default",
+            2,
+            5,
+            b"chk",
+            b"t1",
+            b"hello",
+            token,
+        );
+
+        let jobs = decode_fetch_response(&raw).unwrap();
+        assert_eq!(jobs.len(), 1);
+
+        let job = &jobs[0];
+        assert_eq!(job.id, "job-1");
+        assert_eq!(job.queue, "default");
+        assert_eq!(job.attempt, 2);
+        assert_eq!(job.max_retries, 5);
+        assert_eq!(job.checkpoint, b"chk");
+        assert_eq!(job.tags, b"t1");
+        assert_eq!(job.payload, b"hello");
+        assert_eq!(job.lease_token, token);
+    }
+
+    #[test]
+    fn decode_fetch_response_lease_token_zero() {
+        let raw = build_fetch_response("j2", "q", 0, 3, b"", b"", b"data", 0);
+        let jobs = decode_fetch_response(&raw).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].lease_token, 0);
+        assert_eq!(jobs[0].payload, b"data");
+    }
+
+    #[test]
+    fn decode_fetch_response_multiple_jobs() {
+        let mut buf = Vec::new();
+        write_u16(&mut buf, 2); // count = 2
+
+        // Job 1
+        let t1: u64 = 111;
+        write_len_prefixed(&mut buf, b"a");
+        write_len_prefixed(&mut buf, b"q1");
+        write_u16(&mut buf, 1);
+        write_u16(&mut buf, 3);
+        write_len_prefixed(&mut buf, b"");
+        write_len_prefixed(&mut buf, b"");
+        write_u16(&mut buf, 0); // empty payload
+        write_u64(&mut buf, t1);
+
+        // Job 2
+        let t2: u64 = 222;
+        write_len_prefixed(&mut buf, b"b");
+        write_len_prefixed(&mut buf, b"q2");
+        write_u16(&mut buf, 0);
+        write_u16(&mut buf, 0);
+        write_len_prefixed(&mut buf, b"cp");
+        write_len_prefixed(&mut buf, b"tag");
+        write_u16(&mut buf, 3);
+        buf.extend_from_slice(b"xyz");
+        write_u64(&mut buf, t2);
+
+        let jobs = decode_fetch_response(&buf).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].id, "a");
+        assert_eq!(jobs[0].lease_token, 111);
+        assert_eq!(jobs[1].id, "b");
+        assert_eq!(jobs[1].lease_token, 222);
+        assert_eq!(jobs[1].payload, b"xyz");
+    }
+
+    #[test]
+    fn decode_fetch_response_lease_token_byte_order() {
+        // Verify the token is read as little-endian by checking raw bytes.
+        let token: u64 = 0x0102_0304_0506_0708;
+        let raw = build_fetch_response("j", "q", 0, 0, b"", b"", b"", token);
+
+        // The last 8 bytes should be the LE encoding of the token.
+        let last8 = &raw[raw.len() - 8..];
+        assert_eq!(last8, &token.to_le_bytes());
+
+        let jobs = decode_fetch_response(&raw).unwrap();
+        assert_eq!(jobs[0].lease_token, token);
+    }
+
+    // -- Ack encoding ---------------------------------------------------------
+
+    #[test]
+    fn encode_ack_with_lease_token() {
+        let token: u64 = 0xAABB_CCDD_1122_3344;
+        let ack = AckJob {
+            job_id: "j1".to_string(),
+            queue: "q1".to_string(),
+            ack_status: AckStatus::Done,
+            result: String::new(),
+            checkpoint: String::new(),
+            hold_reason: String::new(),
+            lease_token: token,
+        };
+
+        let mut buf = Vec::new();
+        encode_ack_payload(&mut buf, &[ack]);
+
+        // Parse the buffer to verify structure.
+        let mut r = BufReader::new(&buf);
+
+        // count
+        assert_eq!(r.read_u16().unwrap(), 1);
+        // job_id
+        let id = r.read_len_prefixed().unwrap();
+        assert_eq!(id, b"j1");
+        // queue
+        let q = r.read_len_prefixed().unwrap();
+        assert_eq!(q, b"q1");
+        // ack_status
+        assert_eq!(r.read_u8().unwrap(), 0); // Done
+        // flags -- only lease_token is set
+        let flags = r.read_u8().unwrap();
+        assert_eq!(flags, ACK_FLAG_LEASE_TOKEN); // 0x08
+        assert_eq!(flags & ACK_FLAG_RESULT, 0);
+        assert_eq!(flags & ACK_FLAG_CHECKPOINT, 0);
+        assert_eq!(flags & ACK_FLAG_HOLD_REASON, 0);
+        // lease_token
+        assert_eq!(r.read_u64().unwrap(), token);
+        // should be at end
+        assert_eq!(r.pos, buf.len());
+    }
+
+    #[test]
+    fn encode_ack_with_all_optional_fields_and_lease_token() {
+        let token: u64 = 42;
+        let ack = AckJob {
+            job_id: "j2".to_string(),
+            queue: "q2".to_string(),
+            ack_status: AckStatus::Hold,
+            result: "ok".to_string(),
+            checkpoint: "cp".to_string(),
+            hold_reason: "wait".to_string(),
+            lease_token: token,
+        };
+
+        let mut buf = Vec::new();
+        encode_ack_payload(&mut buf, &[ack]);
+
+        let mut r = BufReader::new(&buf);
+        assert_eq!(r.read_u16().unwrap(), 1); // count
+        let _ = r.read_len_prefixed().unwrap(); // job_id
+        let _ = r.read_len_prefixed().unwrap(); // queue
+        assert_eq!(r.read_u8().unwrap(), 1); // Hold
+        let flags = r.read_u8().unwrap();
+        assert_eq!(
+            flags,
+            ACK_FLAG_RESULT | ACK_FLAG_CHECKPOINT | ACK_FLAG_HOLD_REASON | ACK_FLAG_LEASE_TOKEN
+        );
+        // result
+        assert_eq!(r.read_len_prefixed().unwrap(), b"ok");
+        // checkpoint
+        assert_eq!(r.read_len_prefixed().unwrap(), b"cp");
+        // hold_reason
+        assert_eq!(r.read_len_prefixed().unwrap(), b"wait");
+        // lease_token
+        assert_eq!(r.read_u64().unwrap(), 42);
+        assert_eq!(r.pos, buf.len());
+    }
+
+    #[test]
+    fn encode_ack_lease_token_zero_omits_flag() {
+        let ack = AckJob {
+            job_id: "j3".to_string(),
+            queue: "q3".to_string(),
+            ack_status: AckStatus::Done,
+            result: String::new(),
+            checkpoint: String::new(),
+            hold_reason: String::new(),
+            lease_token: 0,
+        };
+
+        let mut buf = Vec::new();
+        encode_ack_payload(&mut buf, &[ack]);
+
+        let mut r = BufReader::new(&buf);
+        assert_eq!(r.read_u16().unwrap(), 1);
+        let _ = r.read_len_prefixed().unwrap(); // job_id
+        let _ = r.read_len_prefixed().unwrap(); // queue
+        assert_eq!(r.read_u8().unwrap(), 0); // Done
+        let flags = r.read_u8().unwrap();
+        // No flags should be set at all.
+        assert_eq!(flags, 0x00);
+        assert_eq!(flags & ACK_FLAG_LEASE_TOKEN, 0, "flag 0x08 must NOT be set when lease_token is 0");
+        // Nothing more to read.
+        assert_eq!(r.pos, buf.len());
+    }
+
+    // -- Fail encoding --------------------------------------------------------
+
+    #[test]
+    fn encode_fail_with_lease_token() {
+        let token: u64 = 0x1234_5678_9ABC_DEF0;
+        let fail = FailJob {
+            job_id: "fj1".to_string(),
+            queue: "fq1".to_string(),
+            error: "boom".to_string(),
+            backtrace: "bt".to_string(),
+            lease_token: token,
+        };
+
+        let mut buf = Vec::new();
+        encode_fail_payload(&mut buf, &[fail]);
+
+        let mut r = BufReader::new(&buf);
+        assert_eq!(r.read_u16().unwrap(), 1); // count
+        assert_eq!(r.read_len_prefixed().unwrap(), b"fj1");
+        assert_eq!(r.read_len_prefixed().unwrap(), b"fq1");
+        assert_eq!(r.read_len_prefixed().unwrap(), b"boom");
+        assert_eq!(r.read_len_prefixed().unwrap(), b"bt");
+        let flags = r.read_u8().unwrap();
+        assert_eq!(flags, 0x01);
+        assert_eq!(r.read_u64().unwrap(), token);
+        assert_eq!(r.pos, buf.len());
+    }
+
+    #[test]
+    fn encode_fail_lease_token_zero_omits_token() {
+        let fail = FailJob {
+            job_id: "fj2".to_string(),
+            queue: "fq2".to_string(),
+            error: "err".to_string(),
+            backtrace: String::new(),
+            lease_token: 0,
+        };
+
+        let mut buf = Vec::new();
+        encode_fail_payload(&mut buf, &[fail]);
+
+        let mut r = BufReader::new(&buf);
+        assert_eq!(r.read_u16().unwrap(), 1);
+        let _ = r.read_len_prefixed().unwrap(); // job_id
+        let _ = r.read_len_prefixed().unwrap(); // queue
+        let _ = r.read_len_prefixed().unwrap(); // error
+        let _ = r.read_len_prefixed().unwrap(); // backtrace
+        let flags = r.read_u8().unwrap();
+        assert_eq!(flags, 0x00, "flags must be 0x00 when lease_token is 0");
+        // No lease_token bytes follow.
+        assert_eq!(r.pos, buf.len());
+    }
+
+    #[test]
+    fn encode_fail_lease_token_byte_order() {
+        let token: u64 = 0x0807_0605_0403_0201;
+        let fail = FailJob {
+            job_id: "x".to_string(),
+            queue: "y".to_string(),
+            error: "e".to_string(),
+            backtrace: String::new(),
+            lease_token: token,
+        };
+
+        let mut buf = Vec::new();
+        encode_fail_payload(&mut buf, &[fail]);
+
+        // The last 8 bytes should be the LE encoding of the token.
+        let last8 = &buf[buf.len() - 8..];
+        assert_eq!(last8, &token.to_le_bytes());
+    }
+
+    // -- Round-trip: encode then decode ack payload via BufReader --------------
+
+    #[test]
+    fn ack_round_trip_multiple_jobs() {
+        let acks = vec![
+            AckJob {
+                job_id: "a1".to_string(),
+                queue: "qa".to_string(),
+                ack_status: AckStatus::Done,
+                result: "r1".to_string(),
+                checkpoint: String::new(),
+                hold_reason: String::new(),
+                lease_token: 100,
+            },
+            AckJob {
+                job_id: "a2".to_string(),
+                queue: "qb".to_string(),
+                ack_status: AckStatus::Hold,
+                result: String::new(),
+                checkpoint: "chk".to_string(),
+                hold_reason: "reason".to_string(),
+                lease_token: 0,
+            },
+        ];
+
+        let mut buf = Vec::new();
+        encode_ack_payload(&mut buf, &acks);
+
+        let mut r = BufReader::new(&buf);
+        let count = r.read_u16().unwrap();
+        assert_eq!(count, 2);
+
+        // Ack 1: has result + lease_token
+        let id1 = r.read_len_prefixed().unwrap();
+        assert_eq!(id1, b"a1");
+        let _ = r.read_len_prefixed().unwrap(); // queue
+        assert_eq!(r.read_u8().unwrap(), 0); // Done
+        let f1 = r.read_u8().unwrap();
+        assert_eq!(f1 & ACK_FLAG_RESULT, ACK_FLAG_RESULT);
+        assert_eq!(f1 & ACK_FLAG_LEASE_TOKEN, ACK_FLAG_LEASE_TOKEN);
+        assert_eq!(r.read_len_prefixed().unwrap(), b"r1"); // result
+        assert_eq!(r.read_u64().unwrap(), 100); // lease_token
+
+        // Ack 2: has checkpoint + hold_reason, no lease_token
+        let id2 = r.read_len_prefixed().unwrap();
+        assert_eq!(id2, b"a2");
+        let _ = r.read_len_prefixed().unwrap(); // queue
+        assert_eq!(r.read_u8().unwrap(), 1); // Hold
+        let f2 = r.read_u8().unwrap();
+        assert_eq!(f2 & ACK_FLAG_CHECKPOINT, ACK_FLAG_CHECKPOINT);
+        assert_eq!(f2 & ACK_FLAG_HOLD_REASON, ACK_FLAG_HOLD_REASON);
+        assert_eq!(f2 & ACK_FLAG_LEASE_TOKEN, 0);
+        assert_eq!(r.read_len_prefixed().unwrap(), b"chk");
+        assert_eq!(r.read_len_prefixed().unwrap(), b"reason");
+
+        assert_eq!(r.pos, buf.len());
     }
 }
 
