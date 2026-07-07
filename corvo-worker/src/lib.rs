@@ -20,6 +20,10 @@ pub struct WorkerConfig {
     pub rpc_host: String,
     /// RPC port for the binary protocol (default 7438).
     pub rpc_port: u16,
+    /// Optional auth token (API key or admin password) sent via the MSG_AUTH
+    /// handshake on each RPC (re)connect. Required when the server is started
+    /// with an admin password; leave `None` otherwise.
+    pub rpc_auth_token: Option<String>,
 }
 
 impl Default for WorkerConfig {
@@ -32,6 +36,7 @@ impl Default for WorkerConfig {
             shutdown_timeout: Duration::from_secs(30),
             rpc_host: "127.0.0.1".to_string(),
             rpc_port: 7438,
+            rpc_auth_token: None,
         }
     }
 }
@@ -209,6 +214,7 @@ impl CorvoWorker {
             let client = self.client.clone();
             let rpc_host = self.config.rpc_host.clone();
             let rpc_port = self.config.rpc_port;
+            let rpc_auth_token = self.config.rpc_auth_token.clone();
             let queues = self.config.queues.clone();
             let worker_id = self.config.worker_id.clone();
             let active = active_jobs.clone();
@@ -220,7 +226,7 @@ impl CorvoWorker {
                 let queue_refs: Vec<&str> = queues.iter().map(|s| s.as_str()).collect();
                 let credits: u16 = 1;
 
-                let mut conn = Conn::new(&rpc_host, rpc_port).await;
+                let mut conn = Conn::new_with_auth(&rpc_host, rpc_port, rpc_auth_token.clone()).await;
 
                 loop {
                     if *stopping.lock().await {
@@ -296,6 +302,7 @@ impl CorvoWorker {
                                     result: String::new(),
                                     checkpoint: String::new(),
                                     hold_reason: String::new(),
+                                    lease_token: 0,
                                 });
                                 continue;
                             }
@@ -325,6 +332,7 @@ impl CorvoWorker {
                                     result: String::new(),
                                     checkpoint: String::new(),
                                     hold_reason: String::new(),
+                                    lease_token: 0,
                                 });
                             }
                             Err(e) => {

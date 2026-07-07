@@ -23,6 +23,7 @@ const MSG_ENQUEUE_BATCH: u8 = 0x01;
 const MSG_FETCH_BATCH: u8 = 0x02;
 const MSG_ACK_BATCH: u8 = 0x03;
 const MSG_PING: u8 = 0x04;
+const MSG_AUTH: u8 = 0x05; // Connection auth handshake (client -> server).
 const MSG_HEARTBEAT: u8 = 0x06;
 const MSG_FAIL_BATCH: u8 = 0x07;
 
@@ -31,6 +32,7 @@ const MSG_ENQUEUE_BATCH_RESP: u8 = 0x81;
 const MSG_FETCH_BATCH_RESP: u8 = 0x82;
 const MSG_ACK_BATCH_RESP: u8 = 0x83;
 const MSG_PONG: u8 = 0x84;
+const MSG_AUTH_RESP: u8 = 0x85; // Auth handshake result (server -> client).
 const MSG_HEARTBEAT_RESP: u8 = 0x86;
 const MSG_FAIL_BATCH_RESP: u8 = 0x87;
 const MSG_ERROR: u8 = 0xFF;
@@ -201,6 +203,10 @@ pub struct Conn {
     stream: Option<TcpStream>,
     host: String,
     port: u16,
+    /// Optional auth token (API key or admin password) sent via the MSG_AUTH
+    /// handshake immediately after each (re)connect. When `None`, no handshake
+    /// is performed (backward compatible with unauthenticated servers).
+    auth_token: Option<String>,
     req_id: u32,
     send_buf: Vec<u8>,
     recv_buf: Vec<u8>,
@@ -211,18 +217,36 @@ impl Conn {
     ///
     /// Sets `TCP_NODELAY` for low-latency request/response cycles.
     pub async fn new(host: &str, port: u16) -> Self {
+        Self::new_with_auth(host, port, None).await
+    }
+
+    /// Create a new connection that authenticates with the given token (an API
+    /// key or the admin password) via the MSG_AUTH handshake immediately after
+    /// each (re)connect. Required when the server is started with an admin
+    /// password; pass `None` otherwise.
+    ///
+    /// Sets `TCP_NODELAY` for low-latency request/response cycles. If the
+    /// handshake fails, the socket is dropped; the next `reconnect` retries it.
+    pub async fn new_with_auth(host: &str, port: u16, auth_token: Option<String>) -> Self {
         let stream = TcpStream::connect((host, port)).await.ok();
         if let Some(ref s) = stream {
             let _ = s.set_nodelay(true);
         }
-        Self {
+        let mut conn = Self {
             stream,
             host: host.to_string(),
             port,
+            auth_token,
             req_id: 0,
             send_buf: Vec::with_capacity(65536),
             recv_buf: Vec::with_capacity(65536),
+        };
+        // Authenticate before any other frame if a token is configured. On
+        // failure, drop the socket so a later reconnect retries the handshake.
+        if conn.auth_token.is_some() && conn.stream.is_some() && conn.authenticate().await.is_err() {
+            conn.stream = None;
         }
+        conn
     }
 
     /// Close the connection.
@@ -233,11 +257,48 @@ impl Conn {
     }
 
     /// Reconnect to the server (e.g., after a transient failure).
+    ///
+    /// Re-runs the MSG_AUTH handshake before any other frame when an auth token
+    /// is configured. On auth failure the socket is dropped and the error is
+    /// returned.
     pub async fn reconnect(&mut self) -> Result<(), ConnError> {
         self.close().await;
         let stream = TcpStream::connect((self.host.as_str(), self.port)).await?;
         let _ = stream.set_nodelay(true);
         self.stream = Some(stream);
+        if self.auth_token.is_some() {
+            if let Err(e) = self.authenticate().await {
+                self.stream = None;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Perform the MSG_AUTH handshake on a freshly-opened connection.
+    ///
+    /// Wire: send MSG_AUTH with payload `[token_len:u8][token bytes]` (token
+    /// truncated to 255 bytes); read MSG_AUTH_RESP with payload
+    /// `[status:u8 (0=ok)][role:u8]`. Must run before any other frame when an
+    /// auth token is configured. Returns an error on a non-zero status or an
+    /// unexpected response type; the caller drops the socket.
+    async fn authenticate(&mut self) -> Result<(), ConnError> {
+        let token = self.auth_token.clone().unwrap_or_default();
+        let token_bytes = token.as_bytes();
+        let len = token_bytes.len().min(255);
+
+        self.send_buf.clear();
+        self.send_buf.push(len as u8);
+        self.send_buf.extend_from_slice(&token_bytes[..len]);
+        self.send_frame(MSG_AUTH).await?;
+
+        let (msg_type, payload) = self.recv_frame().await?;
+        if msg_type != MSG_AUTH_RESP {
+            return Err(ConnError::UnexpectedResponse(msg_type));
+        }
+        if payload.is_empty() || payload[0] != 0 {
+            return Err(ConnError::Server("authentication failed".to_string()));
+        }
         Ok(())
     }
 
