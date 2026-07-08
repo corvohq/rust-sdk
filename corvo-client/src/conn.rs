@@ -18,6 +18,11 @@ use tokio::net::TcpStream;
 
 const FRAME_HEADER_SIZE: usize = 9;
 
+/// Maximum RPC payload size, mirroring the server's `rpc.MAX_PAYLOAD_SIZE`
+/// (256 KiB). Bounds per-job payload lengths decoded from fetch responses so a
+/// malformed length can't drive an unbounded read.
+const MAX_PAYLOAD_SIZE: usize = 256 * 1024;
+
 // Request message types.
 const MSG_ENQUEUE_BATCH: u8 = 0x01;
 const MSG_FETCH_BATCH: u8 = 0x02;
@@ -38,6 +43,7 @@ const MSG_FAIL_BATCH_RESP: u8 = 0x87;
 const MSG_ERROR: u8 = 0xFF;
 
 const MSG_CANCEL_SIGNAL: u8 = 0x08; // server -> client push
+const MSG_NOT_LEADER: u8 = 0x09; // server -> client push: leader stepped down (retry-later)
 
 // Bulk action request/response.
 const MSG_BULK_ACTION: u8 = 0x14;
@@ -465,6 +471,15 @@ impl Conn {
                 String::from_utf8_lossy(payload).to_string(),
             ));
         }
+        if msg_type == MSG_NOT_LEADER {
+            // The connected node lost leadership. Surface a retryable error so
+            // the worker loop backs off and re-subscribes. Leader redial is not
+            // handled here.
+            return Err(ConnError::Server(format!(
+                "not leader: {}",
+                String::from_utf8_lossy(payload)
+            )));
+        }
         if msg_type != MSG_FETCH_BATCH_RESP {
             return Err(ConnError::UnexpectedResponse(msg_type));
         }
@@ -511,6 +526,14 @@ impl Conn {
                 Err(ConnError::Server(
                     String::from_utf8_lossy(payload).to_string(),
                 ))
+            }
+            // Leader stepped down: retryable, consistent with MSG_ERROR. Leader
+            // redial is out of scope; the caller backs off and re-subscribes.
+            MSG_NOT_LEADER => {
+                Err(ConnError::Server(format!(
+                    "not leader: {}",
+                    String::from_utf8_lossy(payload)
+                )))
             }
             _ => Err(ConnError::UnexpectedResponse(msg_type)),
         }
@@ -785,7 +808,14 @@ fn decode_fetch_response(payload: &[u8]) -> Result<Vec<FetchedJob>, ConnError> {
         let max_retries = r.read_u16()?;
         let checkpoint = r.read_len_prefixed()?;
         let tags = r.read_len_prefixed()?;
-        let payload_len = r.read_u16()? as usize;
+        // Payload length is a u32: the server's default max payload (65536) and
+        // its hard cap (256 KiB) both exceed u16's 65535 range.
+        let payload_len = r.read_u32()? as usize;
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(ConnError::Protocol(format!(
+                "fetch payload length {payload_len} exceeds max {MAX_PAYLOAD_SIZE}"
+            )));
+        }
         let payload_bytes = r.read_bytes(payload_len)?;
         let lease_token = r.read_u64()?;
 
@@ -862,6 +892,20 @@ impl<'a> BufReader<'a> {
         }
         let v = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
         self.pos += 2;
+        Ok(v)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ConnError> {
+        if self.pos + 4 > self.data.len() {
+            return Err(ConnError::Protocol("short read: u32".to_string()));
+        }
+        let v = u32::from_le_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
+        self.pos += 4;
         Ok(v)
     }
 
@@ -1007,8 +1051,8 @@ mod tests {
         write_u16(&mut buf, max_retries);
         write_len_prefixed(&mut buf, checkpoint);
         write_len_prefixed(&mut buf, tags);
-        // payload is u16-prefixed
-        write_u16(&mut buf, payload.len() as u16);
+        // payload is u32-prefixed
+        write_u32(&mut buf, payload.len() as u32);
         buf.extend_from_slice(payload);
         write_u64(&mut buf, lease_token);
         buf
@@ -1066,7 +1110,7 @@ mod tests {
         write_u16(&mut buf, 3);
         write_len_prefixed(&mut buf, b"");
         write_len_prefixed(&mut buf, b"");
-        write_u16(&mut buf, 0); // empty payload
+        write_u32(&mut buf, 0); // empty payload
         write_u64(&mut buf, t1);
 
         // Job 2
@@ -1077,7 +1121,7 @@ mod tests {
         write_u16(&mut buf, 0);
         write_len_prefixed(&mut buf, b"cp");
         write_len_prefixed(&mut buf, b"tag");
-        write_u16(&mut buf, 3);
+        write_u32(&mut buf, 3);
         buf.extend_from_slice(b"xyz");
         write_u64(&mut buf, t2);
 
@@ -1102,6 +1146,52 @@ mod tests {
 
         let jobs = decode_fetch_response(&raw).unwrap();
         assert_eq!(jobs[0].lease_token, token);
+    }
+
+    #[test]
+    fn decode_fetch_response_64kib_payload() {
+        // The server's default max_payload_size is exactly 65536 bytes, which
+        // the old u16 length field (max 65535) could not represent. Exercises
+        // the u32 payload-length decode.
+        let payload = vec![0xABu8; 65_536];
+        let token: u64 = 0x0011_2233_4455_6677;
+        let raw = build_fetch_response("big", "q", 1, 4, b"", b"", &payload, token);
+
+        let jobs = decode_fetch_response(&raw).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].payload.len(), 65_536);
+        assert_eq!(jobs[0].payload, payload);
+        assert_eq!(jobs[0].lease_token, token);
+    }
+
+    #[test]
+    fn decode_fetch_response_payload_len_at_max() {
+        // A payload at the protocol maximum (256 KiB) decodes cleanly.
+        let payload = vec![0x5Au8; MAX_PAYLOAD_SIZE];
+        let raw = build_fetch_response("max", "q", 0, 0, b"", b"", &payload, 0);
+        let jobs = decode_fetch_response(&raw).unwrap();
+        assert_eq!(jobs[0].payload.len(), MAX_PAYLOAD_SIZE);
+    }
+
+    #[test]
+    fn decode_fetch_response_rejects_oversized_payload_len() {
+        // A payload length above the protocol maximum is rejected before any
+        // large read is attempted.
+        let mut buf = Vec::new();
+        write_u16(&mut buf, 1); // count
+        write_len_prefixed(&mut buf, b"j");
+        write_len_prefixed(&mut buf, b"q");
+        write_u16(&mut buf, 0); // attempt
+        write_u16(&mut buf, 0); // max_retries
+        write_len_prefixed(&mut buf, b""); // checkpoint
+        write_len_prefixed(&mut buf, b""); // tags
+        write_u32(&mut buf, (MAX_PAYLOAD_SIZE + 1) as u32); // oversized payload_len
+
+        let err = decode_fetch_response(&buf).unwrap_err();
+        assert!(
+            matches!(err, ConnError::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
     }
 
     // -- Ack encoding ---------------------------------------------------------
@@ -1340,6 +1430,118 @@ mod tests {
         assert_eq!(r.read_len_prefixed().unwrap(), b"reason");
 
         assert_eq!(r.pos, buf.len());
+    }
+
+    // -- Read-loop frame handling (loopback) ----------------------------------
+
+    /// Spawn a fake server that accepts one connection, drains the client's
+    /// subscribe frame, then writes a single response frame carrying
+    /// `msg_type` + `payload`. Returns the bound port.
+    async fn serve_one_frame(msg_type: u8, payload: Vec<u8>) -> u16 {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the client's subscribe frame so our write can't be misread
+            // as part of it.
+            let mut header = [0u8; FRAME_HEADER_SIZE];
+            if sock.read_exact(&mut header).await.is_ok() {
+                let body_len =
+                    u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+                let mut body = vec![0u8; body_len];
+                let _ = sock.read_exact(&mut body).await;
+            }
+
+            let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
+            frame.push(msg_type);
+            frame.extend_from_slice(&0u32.to_le_bytes()); // req_id
+            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&payload);
+            let _ = sock.write_all(&frame).await;
+            let _ = sock.flush().await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn read_pushed_jobs_error_frame_is_retryable_not_fatal() {
+        // A capacity rejection to a subscribe must surface as a retryable
+        // Server error, never a panic or hang.
+        let msg = b"subscription rejected: server at connection capacity".to_vec();
+        let port = serve_one_frame(MSG_ERROR, msg).await;
+
+        let mut conn = Conn::new("127.0.0.1", port).await;
+        conn.subscribe(&["q"], "w", 1).await.unwrap();
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_pushed_jobs())
+            .await
+            .expect("read_pushed_jobs hung");
+        match res {
+            Err(ConnError::Server(m)) => {
+                assert!(m.contains("capacity"), "unexpected message: {m}")
+            }
+            other => panic!("expected retryable Server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_pushed_jobs_not_leader_frame_is_clean_error() {
+        // An unexpected NOT_LEADER (0x09) push must not crash the read loop; it
+        // becomes a clean, retryable error.
+        let port = serve_one_frame(MSG_NOT_LEADER, b"10.0.0.2:7438".to_vec()).await;
+
+        let mut conn = Conn::new("127.0.0.1", port).await;
+        conn.subscribe(&["q"], "w", 1).await.unwrap();
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_pushed_jobs())
+            .await
+            .expect("read_pushed_jobs hung");
+        match res {
+            Err(ConnError::Server(m)) => {
+                assert!(m.contains("not leader"), "unexpected message: {m}")
+            }
+            other => panic!("expected retryable Server error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_frame_not_leader_is_clean_error() {
+        // Same guarantee via the multiplexed read_frame dispatch.
+        let port = serve_one_frame(MSG_NOT_LEADER, Vec::new()).await;
+
+        let mut conn = Conn::new("127.0.0.1", port).await;
+        conn.subscribe(&["q"], "w", 1).await.unwrap();
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_frame())
+            .await
+            .expect("read_frame hung");
+        assert!(
+            matches!(res, Err(ConnError::Server(_))),
+            "expected retryable Server error, got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_pushed_jobs_decodes_64kib_payload_end_to_end() {
+        // A default-max (65536-byte) payload must round-trip through the frame
+        // reader and decoder end to end.
+        let payload = vec![0x7Eu8; 65_536];
+        let frame_body = build_fetch_response("big", "q", 0, 0, b"", b"", &payload, 42);
+        let port = serve_one_frame(MSG_FETCH_BATCH_RESP, frame_body).await;
+
+        let mut conn = Conn::new("127.0.0.1", port).await;
+        conn.subscribe(&["q"], "w", 1).await.unwrap();
+
+        let jobs = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_pushed_jobs())
+            .await
+            .expect("read_pushed_jobs hung")
+            .expect("decode failed");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].payload.len(), 65_536);
+        assert_eq!(jobs[0].payload, payload);
+        assert_eq!(jobs[0].lease_token, 42);
     }
 }
 
